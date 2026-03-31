@@ -5,7 +5,7 @@
 #pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "advapi32.lib")
 
-// Define SystemTraceControlGuid if not provided by the linker
+// SystemTraceControlGuid - required for NT Kernel Logger
 static const GUID s_SystemTraceControlGuid =
     {0x9e814aad, 0x3204, 0x11d2, {0x9a, 0x82, 0x00, 0x60, 0x08, 0xa8, 0x69, 0x39}};
 
@@ -17,7 +17,8 @@ const GUID EtwMonitor::TcpIpGuid_ =
 const GUID EtwMonitor::UdpIpGuid_ =
     {0xBF3A50C5, 0xA9C9, 0x4988, {0xA0, 0x05, 0x2D, 0xF0, 0xB7, 0xC8, 0x0F, 0x80}};
 
-static const wchar_t* SESSION_NAME = L"NetMonitorEtwSession";
+// NT Kernel Logger requires this exact session name
+static const wchar_t* KERNEL_SESSION_NAME = KERNEL_LOGGER_NAMEW;
 
 EtwMonitor* EtwMonitor::instance_ = nullptr;
 
@@ -39,45 +40,62 @@ EtwMonitor::~EtwMonitor() {
     stop();
 }
 
+static size_t calcBufSize() {
+    return sizeof(EVENT_TRACE_PROPERTIES)
+         + (wcslen(KERNEL_SESSION_NAME) + 1) * sizeof(wchar_t)
+         + sizeof(wchar_t) * 2; // extra padding for LogFileName
+}
+
+static EVENT_TRACE_PROPERTIES* makeProps(std::vector<BYTE>& buf) {
+    size_t sz = calcBufSize();
+    buf.assign(sz, 0);
+    auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data());
+    p->Wnode.BufferSize = static_cast<ULONG>(sz);
+    p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+    return p;
+}
+
 bool EtwMonitor::start() {
     if (running_) return true;
     instance_ = this;
 
-    // Stop any previous session with the same name
+    // Stop any previous NT Kernel Logger session
     {
-        size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + (wcslen(SESSION_NAME) + 1) * sizeof(wchar_t);
-        std::vector<BYTE> buf(bufSize, 0);
-        auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data());
-        props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
-        props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-        ControlTrace(0, SESSION_NAME, props, EVENT_TRACE_CONTROL_STOP);
+        std::vector<BYTE> buf;
+        auto* props = makeProps(buf);
+        ControlTraceW(0, KERNEL_SESSION_NAME, props, EVENT_TRACE_CONTROL_STOP);
     }
 
-    // Allocate properties
-    size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + (wcslen(SESSION_NAME) + 1) * sizeof(wchar_t);
-    std::vector<BYTE> propBuf(bufSize, 0);
-    auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propBuf.data());
+    // Allocate and fill properties for new session
+    std::vector<BYTE> propBuf;
+    auto* props = makeProps(propBuf);
 
-    props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
     props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
     props->Wnode.ClientContext = 1; // QPC clock
     props->Wnode.Guid = s_SystemTraceControlGuid;
     props->EnableFlags = EVENT_TRACE_FLAG_NETWORK_TCPIP;
     props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-    props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+    props->BufferSize = 64;        // 64 KB per buffer
+    props->MinimumBuffers = 4;
+    props->MaximumBuffers = 64;
+    props->FlushTimer = 1;         // flush every 1 second
 
-    ULONG status = StartTraceW(&sessionHandle_, SESSION_NAME, props);
+    ULONG status = StartTraceW(&sessionHandle_, KERNEL_SESSION_NAME, props);
     if (status != ERROR_SUCCESS) {
         lastError_ = L"StartTrace failed: " + std::to_wstring(status);
         if (status == ERROR_ACCESS_DENIED) {
             lastError_ += L" (需要管理员权限)";
+        } else if (status == ERROR_INVALID_PARAMETER) {
+            lastError_ += L" (参数错误)";
+        } else if (status == ERROR_ALREADY_EXISTS) {
+            lastError_ += L" (会话已存在，请关闭其他 ETW 工具后重试)";
         }
         return false;
     }
 
     // Open trace for consuming
     EVENT_TRACE_LOGFILEW logFile = {};
-    logFile.LoggerName = const_cast<LPWSTR>(SESSION_NAME);
+    logFile.LoggerName = const_cast<LPWSTR>(KERNEL_SESSION_NAME);
     logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
     logFile.EventRecordCallback = EventRecordCallback;
 
@@ -101,12 +119,9 @@ bool EtwMonitor::start() {
 
 void EtwMonitor::stop() {
     if (sessionHandle_ != INVALID_PROCESSTRACE_HANDLE) {
-        size_t bufSize = sizeof(EVENT_TRACE_PROPERTIES) + (wcslen(SESSION_NAME) + 1) * sizeof(wchar_t);
-        std::vector<BYTE> buf(bufSize, 0);
-        auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data());
-        props->Wnode.BufferSize = static_cast<ULONG>(bufSize);
-        props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-        ControlTrace(sessionHandle_, nullptr, props, EVENT_TRACE_CONTROL_STOP);
+        std::vector<BYTE> buf;
+        auto* props = makeProps(buf);
+        ControlTraceW(sessionHandle_, nullptr, props, EVENT_TRACE_CONTROL_STOP);
         sessionHandle_ = INVALID_PROCESSTRACE_HANDLE;
     }
 

@@ -3,6 +3,7 @@
 #include <psapi.h>
 #include <sstream>
 #include <iomanip>
+#include <algorithm>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "psapi.lib")
@@ -10,34 +11,25 @@
 static const wchar_t* WINDOW_CLASS = L"NetMonitorMainWindow";
 
 MainWindow::MainWindow() : tracker_(3600) {
-    tracker_.setNameResolver([](uint32_t pid) {
-        return resolveProcess(pid);
-    });
+    tracker_.setNameResolver([](uint32_t pid) { return resolveProcess(pid); });
 }
 
 MainWindow::~MainWindow() = default;
 
 std::pair<std::wstring, std::wstring> MainWindow::resolveProcess(uint32_t pid) {
-    std::wstring name = L"<unknown>";
-    std::wstring path;
-
+    std::wstring name, path;
     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (hProc) {
         wchar_t buf[MAX_PATH] = {};
         DWORD size = MAX_PATH;
         if (QueryFullProcessImageNameW(hProc, 0, buf, &size)) {
             path = buf;
-            // Extract filename
             auto pos = path.find_last_of(L'\\');
             name = (pos != std::wstring::npos) ? path.substr(pos + 1) : path;
         }
         CloseHandle(hProc);
     }
-
-    if (name == L"<unknown>") {
-        name = L"PID:" + std::to_wstring(pid);
-    }
-
+    if (name.empty()) name = L"PID:" + std::to_wstring(pid);
     return {name, path};
 }
 
@@ -47,20 +39,21 @@ bool MainWindow::create(HINSTANCE hInstance) {
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
     InitCommonControlsEx(&icc);
 
+    Dialogs::registerClasses(hInstance);
+
     WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInstance;
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInstance;
     wc.lpszClassName = WINDOW_CLASS;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hIcon         = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClassExW(&wc);
 
     hwnd_ = CreateWindowExW(0, WINDOW_CLASS, L"NetMonitor - 网络流量监控",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 950, 600,
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1050, 650,
         nullptr, nullptr, hInstance, this);
-
     if (!hwnd_) return false;
 
     ShowWindow(hwnd_, SW_SHOW);
@@ -79,7 +72,6 @@ int MainWindow::run() {
 
 LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     MainWindow* self = nullptr;
-
     if (msg == WM_NCCREATE) {
         auto* cs = reinterpret_cast<CREATESTRUCT*>(lParam);
         self = static_cast<MainWindow*>(cs->lpCreateParams);
@@ -88,67 +80,83 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     } else {
         self = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
-
-    if (self) {
-        return self->handleMessage(msg, wParam, lParam);
-    }
+    if (self) return self->handleMessage(msg, wParam, lParam);
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 LRESULT MainWindow::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_CREATE:
-        onCreate();
+    case WM_CREATE:   onCreate(); return 0;
+    case WM_SIZE:     onSize(LOWORD(lParam), HIWORD(lParam)); return 0;
+    case WM_TIMER:    onTimer(static_cast<UINT_PTR>(wParam)); return 0;
+    case WM_COMMAND:  onCommand(LOWORD(wParam)); return 0;
+    case WM_DESTROY:  onDestroy(); PostQuitMessage(0); return 0;
+    case WM_NOTIFY:
+        onNotify(reinterpret_cast<NMHDR*>(lParam));
         return 0;
-    case WM_SIZE:
-        onSize(LOWORD(lParam), HIWORD(lParam));
-        return 0;
-    case WM_TIMER:
-        onTimer(static_cast<UINT_PTR>(wParam));
-        return 0;
-    case WM_NOTIFY: {
-        auto* nmhdr = reinterpret_cast<NMHDR*>(lParam);
-        if (nmhdr->idFrom == IDC_LISTVIEW && nmhdr->code == NM_RCLICK) {
-            POINT pt;
-            GetCursorPos(&pt);
-            onContextMenu(pt.x, pt.y);
+    case WM_APP + 1: {
+        // Alert triggered notification (posted from callback)
+        int policyId = static_cast<int>(lParam);
+        for (const auto& p : alertManager_.getPolicies()) {
+            if (p.id == policyId) {
+                Dialogs::showAlertNotification(hwnd_, p);
+                break;
+            }
         }
         return 0;
     }
-    case WM_COMMAND:
-        onCommand(LOWORD(wParam));
-        return 0;
-    case WM_DESTROY:
-        onDestroy();
-        PostQuitMessage(0);
-        return 0;
     }
     return DefWindowProcW(hwnd_, msg, wParam, lParam);
 }
 
 void MainWindow::onCreate() {
-    // Create ListView
+    // ── Toolbar panel ─────────────────────────────────────────────
+    toolPanel_ = CreateWindowW(L"STATIC", nullptr,
+        WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+        0, 0, 0, TOOLBAR_H, hwnd_, (HMENU)IDC_TOOLBAR_PANEL, hInstance_, nullptr);
+
+    auto makeBtn = [&](const wchar_t* text, int id, int x) -> HWND {
+        return CreateWindowW(L"BUTTON", text,
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            x, 5, 110, 28, hwnd_, (HMENU)(INT_PTR)id, hInstance_, nullptr);
+    };
+
+    int x = 8;
+    btnDlLimit_  = makeBtn(L"↓ 设置下行限速", IDM_SET_DL_LIMIT,  x); x += 118;
+    btnUlLimit_  = makeBtn(L"↑ 设置上行限速", IDM_SET_UL_LIMIT,  x); x += 118;
+    btnAddAlert_ = makeBtn(L"+ 添加报警策略", IDM_ADD_ALERT,      x); x += 118;
+    btnRmLimit_  = makeBtn(L"× 清除限速",     IDM_REMOVE_LIMITS,  x); x += 118;
+    btnRmAlert_  = makeBtn(L"× 清除报警",     IDM_REMOVE_ALERTS,  x); x += 128;
+    btnAlerts_   = makeBtn(L"≡ 报警策略列表", IDM_SHOW_ALERTS,    x);
+
+    // Add a hint label after the buttons
+    CreateWindowW(L"STATIC",
+        L"提示: 先点击列表中的进程行，再使用上方按钮操作；也可右键点击进程行",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        x + 120, 12, 350, 20, hwnd_, nullptr, hInstance_, nullptr);
+
+    updateToolbarState();
+
+    // ── ListView ──────────────────────────────────────────────────
     listView_ = CreateWindowExW(0, WC_LISTVIEWW, nullptr,
         WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-        0, 0, 0, 0, hwnd_, (HMENU)IDC_LISTVIEW, hInstance_, nullptr);
+        0, TOOLBAR_H, 0, 0, hwnd_, (HMENU)IDC_LISTVIEW, hInstance_, nullptr);
 
     ListView_SetExtendedListViewStyle(listView_,
         LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
 
-    // Add columns
     struct ColInfo { const wchar_t* name; int width; };
     ColInfo cols[] = {
         {L"PID",        60},
-        {L"进程名",     140},
-        {L"下行速率",    100},
-        {L"上行速率",    100},
-        {L"总下行",      100},
-        {L"总上行",      100},
-        {L"下行限速",    90},
-        {L"上行限速",    90},
-        {L"状态",       100},
+        {L"进程名",    140},
+        {L"下行速率",  110},
+        {L"上行速率",  110},
+        {L"总下行",    100},
+        {L"总上行",    100},
+        {L"下行限速",   90},
+        {L"上行限速",   90},
+        {L"状态",       90},
     };
-
     for (int i = 0; i < _countof(cols); i++) {
         LVCOLUMNW col = {};
         col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -158,61 +166,81 @@ void MainWindow::onCreate() {
         ListView_InsertColumn(listView_, i, &col);
     }
 
-    // Create status bar
+    // ── Status bar ────────────────────────────────────────────────
     statusBar_ = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr,
         WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
         0, 0, 0, 0, hwnd_, (HMENU)IDC_STATUSBAR, hInstance_, nullptr);
 
-    // Start ETW monitor
+    // ── ETW monitor ───────────────────────────────────────────────
     etwMonitor_.setCallback([this](uint32_t pid, uint32_t bytes, Direction dir) {
         tracker_.addTraffic(pid, bytes, dir);
+
+        // Check token bucket for rate limiting
+        auto it = limits_.find(pid);
+        if (it == limits_.end()) return;
+        auto& ls = it->second;
+        if (dir == Direction::Upload && ls.sendBucket && ls.sendLimit > 0) {
+            if (!ls.sendBucket->tryConsume(bytes) && !ls.processPath.empty())
+                wfpLimiter_.blockProcess(pid, ls.processPath, Direction::Upload);
+        } else if (dir == Direction::Download && ls.recvBucket && ls.recvLimit > 0) {
+            if (!ls.recvBucket->tryConsume(bytes) && !ls.processPath.empty())
+                wfpLimiter_.blockProcess(pid, ls.processPath, Direction::Download);
+        }
     });
 
     if (!etwMonitor_.start()) {
-        std::wstring err = L"ETW 启动失败: " + etwMonitor_.getLastError();
-        MessageBoxW(hwnd_, err.c_str(), L"警告", MB_OK | MB_ICONWARNING);
+        MessageBoxW(hwnd_,
+            (L"ETW 启动失败: " + etwMonitor_.getLastError()).c_str(),
+            L"警告", MB_OK | MB_ICONWARNING);
     }
 
-    // Initialize WFP limiter
+    // ── WFP ───────────────────────────────────────────────────────
     if (!wfpLimiter_.init()) {
-        std::wstring err = L"WFP 初始化失败: " + wfpLimiter_.getLastError();
-        MessageBoxW(hwnd_, err.c_str(), L"警告", MB_OK | MB_ICONWARNING);
+        MessageBoxW(hwnd_,
+            (L"WFP 初始化失败: " + wfpLimiter_.getLastError()).c_str(),
+            L"警告", MB_OK | MB_ICONWARNING);
     }
 
-    // Set alert callback
+    // ── Alert callback ────────────────────────────────────────────
     alertManager_.setAlertCallback([this](const AlertPolicy& policy, const AlertAction& action) {
-        // Apply rate limit
-        auto& ls = limits_[action.pid];
-        if (action.direction == Direction::Download) {
-            ls.recvLimit = action.limitBytesPerSec;
-            ls.recvBucket = std::make_unique<TokenBucket>(action.limitBytesPerSec, action.limitBytesPerSec);
-        } else {
-            ls.sendLimit = action.limitBytesPerSec;
-            ls.sendBucket = std::make_unique<TokenBucket>(action.limitBytesPerSec, action.limitBytesPerSec);
-        }
-        if (ls.processPath.empty()) {
-            auto [name, path] = resolveProcess(action.pid);
-            ls.processPath = path;
-        }
-
-        // Show notification asynchronously
+        applyLimitToProcess(action.pid, action.direction, action.limitBytesPerSec);
         PostMessageW(hwnd_, WM_APP + 1, 0, static_cast<LPARAM>(policy.id));
     });
 
-    // Start timers
-    SetTimer(hwnd_, IDT_REFRESH, 1000, nullptr);   // 1 second UI refresh
-    SetTimer(hwnd_, IDT_LIMITER, 100, nullptr);     // 100ms limiter check
+    // ── Timers ────────────────────────────────────────────────────
+    SetTimer(hwnd_, IDT_REFRESH, 1000, nullptr);
+    SetTimer(hwnd_, IDT_LIMITER, 100,  nullptr);
+}
+
+void MainWindow::applyLimitToProcess(uint32_t pid, Direction dir, uint64_t limitBytesPerSec) {
+    auto& ls = limits_[pid];
+    if (ls.processPath.empty()) {
+        auto [name, path] = resolveProcess(pid);
+        ls.processPath = path;
+    }
+    if (dir == Direction::Download) {
+        ls.recvLimit  = limitBytesPerSec;
+        ls.recvBucket = limitBytesPerSec > 0
+            ? std::make_unique<TokenBucket>(limitBytesPerSec, limitBytesPerSec)
+            : nullptr;
+        if (limitBytesPerSec == 0)
+            wfpLimiter_.unblockProcess(pid, Direction::Download);
+    } else {
+        ls.sendLimit  = limitBytesPerSec;
+        ls.sendBucket = limitBytesPerSec > 0
+            ? std::make_unique<TokenBucket>(limitBytesPerSec, limitBytesPerSec)
+            : nullptr;
+        if (limitBytesPerSec == 0)
+            wfpLimiter_.unblockProcess(pid, Direction::Upload);
+    }
 }
 
 void MainWindow::onTimer(UINT_PTR timerId) {
     if (timerId == IDT_REFRESH) {
         tracker_.update();
-
-        // Evaluate alert policies
         alertManager_.evaluate([this](uint32_t pid, int window, Direction dir) -> uint64_t {
             return tracker_.getTrafficInWindow(pid, window, dir);
         });
-
         refreshListView();
         updateStatusBar();
         tracker_.pruneInactive(30);
@@ -224,22 +252,10 @@ void MainWindow::onTimer(UINT_PTR timerId) {
 void MainWindow::applyLimits() {
     for (auto& [pid, ls] : limits_) {
         if (ls.processPath.empty()) continue;
-
-        // Download limit
-        if (ls.recvBucket && ls.recvLimit > 0) {
-            // Replenish happens automatically via time-based token bucket
-            // Check if there are tokens available
-            if (ls.recvBucket->available() > 0) {
-                wfpLimiter_.unblockProcess(pid, Direction::Download);
-            }
-        }
-
-        // Upload limit
-        if (ls.sendBucket && ls.sendLimit > 0) {
-            if (ls.sendBucket->available() > 0) {
-                wfpLimiter_.unblockProcess(pid, Direction::Upload);
-            }
-        }
+        if (ls.recvBucket && ls.recvLimit > 0 && ls.recvBucket->available() > 0)
+            wfpLimiter_.unblockProcess(pid, Direction::Download);
+        if (ls.sendBucket && ls.sendLimit > 0 && ls.sendBucket->available() > 0)
+            wfpLimiter_.unblockProcess(pid, Direction::Upload);
     }
 }
 
@@ -248,15 +264,47 @@ void MainWindow::onSize(int cx, int cy) {
         SendMessageW(statusBar_, WM_SIZE, 0, 0);
         RECT sbRect;
         GetWindowRect(statusBar_, &sbRect);
-        int sbHeight = sbRect.bottom - sbRect.top;
-        if (listView_) {
-            MoveWindow(listView_, 0, 0, cx, cy - sbHeight, TRUE);
+        int sbH = sbRect.bottom - sbRect.top;
+
+        // Toolbar panel buttons stay at top
+        if (toolPanel_) MoveWindow(toolPanel_, 0, 0, cx, TOOLBAR_H, TRUE);
+        // Reposition all toolbar buttons
+        auto moveChild = [&](HWND h, int x) {
+            if (h) { RECT r; GetWindowRect(h, &r); MapWindowPoints(nullptr, hwnd_, (POINT*)&r, 2);
+                     MoveWindow(h, x, 5, 110, 28, TRUE); }
+        };
+        // Re-layout handled by initial positions (buttons have fixed size)
+
+        if (listView_)
+            MoveWindow(listView_, 0, TOOLBAR_H, cx, cy - TOOLBAR_H - sbH, TRUE);
+    }
+}
+
+void MainWindow::onNotify(NMHDR* nm) {
+    if (nm->idFrom == IDC_LISTVIEW) {
+        if (nm->code == NM_RCLICK) {
+            POINT pt;
+            GetCursorPos(&pt);
+            onContextMenu(pt.x, pt.y);
+        } else if (nm->code == LVN_COLUMNCLICK) {
+            auto* nml = reinterpret_cast<NMLISTVIEW*>(nm);
+            int col = nml->iSubItem;
+            if (col == sortCol_) sortAsc_ = !sortAsc_;
+            else { sortCol_ = col; sortAsc_ = (col == 1); } // text cols default ascending
+            refreshListView();
+        } else if (nm->code == LVN_ITEMCHANGED) {
+            auto* nml = reinterpret_cast<NMLISTVIEW*>(nm);
+            if ((nml->uChanged & LVIF_STATE) && (nml->uNewState & LVIS_SELECTED)) {
+                wchar_t buf[32] = {};
+                ListView_GetItemText(listView_, nml->iItem, 0, buf, 32);
+                selectedPid_ = static_cast<uint32_t>(_wtoi(buf));
+                updateToolbarState();
+            }
         }
     }
 }
 
 void MainWindow::onContextMenu(int x, int y) {
-    // Get selected item
     int sel = ListView_GetNextItem(listView_, -1, LVNI_SELECTED);
     if (sel < 0) return;
 
@@ -264,164 +312,174 @@ void MainWindow::onContextMenu(int x, int y) {
     ListView_GetItemText(listView_, sel, 0, pidBuf, 32);
     selectedPid_ = static_cast<uint32_t>(_wtoi(pidBuf));
 
+    auto it = limits_.find(selectedPid_);
+    uint64_t dlLim = it != limits_.end() ? it->second.recvLimit : 0;
+    uint64_t ulLim = it != limits_.end() ? it->second.sendLimit : 0;
+
     HMENU hMenu = CreatePopupMenu();
-    AppendMenuW(hMenu, MF_STRING, IDM_SET_DL_LIMIT, L"设置下行限速...");
-    AppendMenuW(hMenu, MF_STRING, IDM_SET_UL_LIMIT, L"设置上行限速...");
+    std::wstring dlText = L"↓ 设置下行限速";
+    if (dlLim > 0) dlText += L"  (当前: " + std::to_wstring(dlLim / 1024) + L" KB/s)";
+    std::wstring ulText = L"↑ 设置上行限速";
+    if (ulLim > 0) ulText += L"  (当前: " + std::to_wstring(ulLim / 1024) + L" KB/s)";
+
+    AppendMenuW(hMenu, MF_STRING, IDM_SET_DL_LIMIT, dlText.c_str());
+    AppendMenuW(hMenu, MF_STRING, IDM_SET_UL_LIMIT, ulText.c_str());
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_ADD_ALERT, L"添加报警策略...");
+    AppendMenuW(hMenu, MF_STRING, IDM_ADD_ALERT,     L"+ 添加报警策略...");
+    AppendMenuW(hMenu, MF_STRING, IDM_SHOW_ALERTS,   L"≡ 查看所有报警策略...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_REMOVE_LIMITS, L"移除限速");
-    AppendMenuW(hMenu, MF_STRING, IDM_REMOVE_ALERTS, L"移除报警");
+    AppendMenuW(hMenu, MF_STRING | (dlLim == 0 && ulLim == 0 ? MF_GRAYED : 0),
+                IDM_REMOVE_LIMITS, L"× 清除限速");
+    AppendMenuW(hMenu, MF_STRING, IDM_REMOVE_ALERTS, L"× 清除该进程的报警");
 
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, x, y, 0, hwnd_, nullptr);
     DestroyMenu(hMenu);
 }
 
 void MainWindow::onCommand(int id) {
-    if (selectedPid_ == 0) return;
+    if (id == IDM_SHOW_ALERTS) {
+        Dialogs::showAlertListDialog(hwnd_, alertManager_.getPolicies());
+        return;
+    }
+    if (selectedPid_ == 0 && id != IDM_SHOW_ALERTS) return;
 
     auto snapshot = tracker_.getSnapshot();
     auto it = snapshot.find(selectedPid_);
     std::wstring procName = (it != snapshot.end()) ? it->second.processName : L"Unknown";
+    auto limIt = limits_.find(selectedPid_);
 
     switch (id) {
     case IDM_SET_DL_LIMIT: {
-        uint64_t limit = Dialogs::showLimitDialog(hwnd_, procName, Direction::Download);
-        auto& ls = limits_[selectedPid_];
-        if (ls.processPath.empty()) {
-            auto [name, path] = resolveProcess(selectedPid_);
-            ls.processPath = path;
-        }
-        if (limit > 0) {
-            ls.recvLimit = limit;
-            ls.recvBucket = std::make_unique<TokenBucket>(limit, limit);
-        } else {
-            ls.recvLimit = 0;
-            ls.recvBucket.reset();
-            wfpLimiter_.unblockProcess(selectedPid_, Direction::Download);
-        }
+        uint64_t cur = (limIt != limits_.end()) ? limIt->second.recvLimit : 0;
+        uint64_t limit = Dialogs::showLimitDialog(hwnd_, procName, Direction::Download, cur);
+        if (limit != UINT64_MAX)
+            applyLimitToProcess(selectedPid_, Direction::Download, limit);
         break;
     }
     case IDM_SET_UL_LIMIT: {
-        uint64_t limit = Dialogs::showLimitDialog(hwnd_, procName, Direction::Upload);
-        auto& ls = limits_[selectedPid_];
-        if (ls.processPath.empty()) {
-            auto [name, path] = resolveProcess(selectedPid_);
-            ls.processPath = path;
-        }
-        if (limit > 0) {
-            ls.sendLimit = limit;
-            ls.sendBucket = std::make_unique<TokenBucket>(limit, limit);
-        } else {
-            ls.sendLimit = 0;
-            ls.sendBucket.reset();
-            wfpLimiter_.unblockProcess(selectedPid_, Direction::Upload);
-        }
+        uint64_t cur = (limIt != limits_.end()) ? limIt->second.sendLimit : 0;
+        uint64_t limit = Dialogs::showLimitDialog(hwnd_, procName, Direction::Upload, cur);
+        if (limit != UINT64_MAX)
+            applyLimitToProcess(selectedPid_, Direction::Upload, limit);
         break;
     }
     case IDM_ADD_ALERT: {
         AlertPolicy policy;
-        if (Dialogs::showAlertDialog(hwnd_, procName, selectedPid_, policy)) {
+        if (Dialogs::showAlertDialog(hwnd_, procName, selectedPid_, policy))
             alertManager_.addPolicy(std::move(policy));
-        }
         break;
     }
-    case IDM_REMOVE_LIMITS: {
-        auto& ls = limits_[selectedPid_];
-        ls.sendLimit = 0;
-        ls.recvLimit = 0;
-        ls.sendBucket.reset();
-        ls.recvBucket.reset();
-        wfpLimiter_.unblockProcess(selectedPid_, Direction::Upload);
-        wfpLimiter_.unblockProcess(selectedPid_, Direction::Download);
+    case IDM_REMOVE_LIMITS:
+        applyLimitToProcess(selectedPid_, Direction::Download, 0);
+        applyLimitToProcess(selectedPid_, Direction::Upload,   0);
         break;
-    }
     case IDM_REMOVE_ALERTS: {
         auto policies = alertManager_.getPolicies();
-        for (const auto& p : policies) {
-            if (p.pid == selectedPid_) {
-                alertManager_.removePolicy(p.id);
-            }
-        }
+        for (const auto& p : policies)
+            if (p.pid == selectedPid_) alertManager_.removePolicy(p.id);
         break;
     }
+    }
+    updateToolbarState();
+}
+
+// ── Sort helpers ──────────────────────────────────────────────────────────────
+
+void MainWindow::sortSnapshot(std::vector<ProcessTrafficInfo>& vec) const {
+    std::stable_sort(vec.begin(), vec.end(),
+        [this](const ProcessTrafficInfo& a, const ProcessTrafficInfo& b) {
+            int cmp = compareItems(a, b);
+            return sortAsc_ ? cmp < 0 : cmp > 0;
+        });
+}
+
+int MainWindow::compareItems(const ProcessTrafficInfo& a, const ProcessTrafficInfo& b) const {
+    switch (sortCol_) {
+    case 0: return (int)a.pid - (int)b.pid;
+    case 1: return a.processName.compare(b.processName);
+    case 2: return (a.recvRate > b.recvRate) ? 1 : (a.recvRate < b.recvRate) ? -1 : 0;
+    case 3: return (a.sendRate > b.sendRate) ? 1 : (a.sendRate < b.sendRate) ? -1 : 0;
+    case 4: return (a.totalRecv > b.totalRecv) ? 1 : (a.totalRecv < b.totalRecv) ? -1 : 0;
+    case 5: return (a.totalSent > b.totalSent) ? 1 : (a.totalSent < b.totalSent) ? -1 : 0;
+    case 6: return (int64_t)a.recvLimit - (int64_t)b.recvLimit;
+    case 7: return (int64_t)a.sendLimit - (int64_t)b.sendLimit;
+    default: return 0;
     }
 }
 
-void MainWindow::refreshListView() {
-    auto snapshot = tracker_.getSnapshot();
+// ── List view refresh ─────────────────────────────────────────────────────────
 
-    // Merge limit info into snapshot
-    for (auto& [pid, info] : snapshot) {
+void MainWindow::refreshListView() {
+    auto snapMap = tracker_.getSnapshot();
+
+    // Build a vector for sorting
+    std::vector<ProcessTrafficInfo> items;
+    items.reserve(snapMap.size());
+    for (auto& [pid, info] : snapMap) {
+        if (info.sendRate < 1.0 && info.recvRate < 1.0 &&
+            info.totalSent == 0 && info.totalRecv == 0) continue;
+        // Merge limit state
         auto limIt = limits_.find(pid);
         if (limIt != limits_.end()) {
-            info.sendLimit = limIt->second.sendLimit;
-            info.recvLimit = limIt->second.recvLimit;
+            info.sendLimit   = limIt->second.sendLimit;
+            info.recvLimit   = limIt->second.recvLimit;
             info.sendBlocked = wfpLimiter_.isBlocked(pid, Direction::Upload);
             info.recvBlocked = wfpLimiter_.isBlocked(pid, Direction::Download);
         }
+        items.push_back(std::move(info));
     }
+    sortSnapshot(items);
 
-    // Update ListView - preserve selection
     SendMessageW(listView_, WM_SETREDRAW, FALSE, 0);
 
-    // Build map of existing items for efficient update
-    int itemCount = ListView_GetItemCount(listView_);
-    std::map<uint32_t, int> existingItems;
-    for (int i = 0; i < itemCount; i++) {
-        wchar_t buf[32];
-        ListView_GetItemText(listView_, i, 0, buf, 32);
-        existingItems[static_cast<uint32_t>(_wtoi(buf))] = i;
+    int targetCount = (int)items.size();
+    int curCount    = ListView_GetItemCount(listView_);
+
+    // Remove excess rows
+    while (ListView_GetItemCount(listView_) > targetCount)
+        ListView_DeleteItem(listView_, ListView_GetItemCount(listView_) - 1);
+
+    // Add missing rows
+    while (ListView_GetItemCount(listView_) < targetCount) {
+        LVITEMW lvi = {};
+        lvi.mask  = LVIF_TEXT;
+        lvi.iItem = ListView_GetItemCount(listView_);
+        lvi.pszText = const_cast<LPWSTR>(L"");
+        ListView_InsertItem(listView_, &lvi);
     }
 
-    // Remove items for processes no longer in snapshot
-    for (auto it = existingItems.rbegin(); it != existingItems.rend(); ++it) {
-        if (snapshot.find(it->first) == snapshot.end()) {
-            ListView_DeleteItem(listView_, it->second);
-        }
-    }
-
-    // Add/update items
-    int idx = 0;
-    for (const auto& [pid, info] : snapshot) {
-        // Skip processes with zero traffic
-        if (info.sendRate < 1.0 && info.recvRate < 1.0 &&
-            info.totalSent == 0 && info.totalRecv == 0) continue;
-
-        auto existing = existingItems.find(pid);
-        bool isNew = (existing == existingItems.end());
-
-        if (isNew) {
-            LVITEMW lvi = {};
-            lvi.mask = LVIF_TEXT;
-            lvi.iItem = idx;
-            std::wstring pidStr = std::to_wstring(pid);
-            lvi.pszText = const_cast<LPWSTR>(pidStr.c_str());
-            ListView_InsertItem(listView_, &lvi);
-        }
-
-        int row = isNew ? idx : existing->second;
-
+    // Update all rows
+    for (int row = 0; row < targetCount; row++) {
+        const auto& info = items[row];
         auto setText = [&](int col, const std::wstring& text) {
-            ListView_SetItemText(listView_, row, col, const_cast<LPWSTR>(text.c_str()));
+            ListView_SetItemText(listView_, row, col,
+                                 const_cast<LPWSTR>(text.c_str()));
         };
-
-        setText(0, std::to_wstring(pid));
+        setText(0, std::to_wstring(info.pid));
         setText(1, info.processName);
         setText(2, formatRate(info.recvRate));
         setText(3, formatRate(info.sendRate));
         setText(4, formatBytes(info.totalRecv));
         setText(5, formatBytes(info.totalSent));
-        setText(6, info.recvLimit > 0 ? formatRate(static_cast<double>(info.recvLimit)) : L"无限制");
-        setText(7, info.sendLimit > 0 ? formatRate(static_cast<double>(info.sendLimit)) : L"无限制");
+        setText(6, info.recvLimit > 0 ? formatRate((double)info.recvLimit) : L"无限制");
+        setText(7, info.sendLimit > 0 ? formatRate((double)info.sendLimit) : L"无限制");
+        std::wstring st;
+        if (info.recvBlocked) st += L"↓阻断 ";
+        if (info.sendBlocked) st += L"↑阻断 ";
+        if (st.empty()) st = L"正常";
+        setText(8, st);
+    }
 
-        std::wstring status;
-        if (info.recvBlocked) status += L"↓阻断 ";
-        if (info.sendBlocked) status += L"↑阻断 ";
-        if (status.empty()) status = L"正常";
-        setText(8, status);
-
-        idx++;
+    // Draw sort indicator on column header
+    HWND hHeader = ListView_GetHeader(listView_);
+    int colCount = Header_GetItemCount(hHeader);
+    for (int i = 0; i < colCount; i++) {
+        HDITEMW hi = {};
+        hi.mask = HDI_FORMAT;
+        Header_GetItem(hHeader, i, &hi);
+        hi.fmt &= ~(HDF_SORTDOWN | HDF_SORTUP);
+        if (i == sortCol_) hi.fmt |= sortAsc_ ? HDF_SORTUP : HDF_SORTDOWN;
+        Header_SetItem(hHeader, i, &hi);
     }
 
     SendMessageW(listView_, WM_SETREDRAW, TRUE, 0);
@@ -430,42 +488,45 @@ void MainWindow::refreshListView() {
 
 void MainWindow::updateStatusBar() {
     auto snapshot = tracker_.getSnapshot();
-    int processCount = 0;
-    double totalDl = 0, totalUl = 0;
+    int cnt = 0; double dl = 0, ul = 0;
     for (const auto& [pid, info] : snapshot) {
-        if (info.sendRate > 0 || info.recvRate > 0) {
-            processCount++;
-            totalDl += info.recvRate;
-            totalUl += info.sendRate;
-        }
+        if (info.sendRate > 0 || info.recvRate > 0) { cnt++; dl += info.recvRate; ul += info.sendRate; }
     }
-
-    int alertCount = 0;
+    int alertsTotal = 0, alertsTriggered = 0;
     for (const auto& p : alertManager_.getPolicies()) {
-        if (p.triggered) alertCount++;
+        alertsTotal++;
+        if (p.triggered) alertsTriggered++;
     }
-
     std::wstringstream ss;
-    ss << L"活跃进程: " << processCount
-       << L"  |  总下行: " << formatRate(totalDl)
-       << L"  |  总上行: " << formatRate(totalUl)
-       << L"  |  已触发报警: " << alertCount
-       << L"  |  ETW: " << (etwMonitor_.isRunning() ? L"运行中" : L"未启动")
-       << L"  |  WFP: " << (wfpLimiter_.isInitialized() ? L"就绪" : L"未初始化");
-
+    ss << L"活跃进程: " << cnt
+       << L"   总下行: " << formatRate(dl)
+       << L"   总上行: " << formatRate(ul)
+       << L"   报警: " << alertsTriggered << L"/" << alertsTotal << L" 已触发"
+       << L"   ETW: " << (etwMonitor_.isRunning() ? L"运行中" : L"未启动")
+       << L"   WFP: " << (wfpLimiter_.isInitialized() ? L"就绪" : L"未初始化");
     SetWindowTextW(statusBar_, ss.str().c_str());
+}
+
+void MainWindow::updateToolbarState() {
+    bool hasSel = (selectedPid_ != 0);
+    auto limIt = limits_.find(selectedPid_);
+    bool hasLimit = hasSel && limIt != limits_.end() &&
+                    (limIt->second.sendLimit > 0 || limIt->second.recvLimit > 0);
+
+    EnableWindow(btnDlLimit_,  hasSel);
+    EnableWindow(btnUlLimit_,  hasSel);
+    EnableWindow(btnAddAlert_, hasSel);
+    EnableWindow(btnRmLimit_,  hasLimit);
+    EnableWindow(btnRmAlert_,  hasSel);
 }
 
 void MainWindow::onDestroy() {
     KillTimer(hwnd_, IDT_REFRESH);
     KillTimer(hwnd_, IDT_LIMITER);
-
-    // Remove all WFP blocks
     for (auto& [pid, ls] : limits_) {
         wfpLimiter_.unblockProcess(pid, Direction::Upload);
         wfpLimiter_.unblockProcess(pid, Direction::Download);
     }
-
     etwMonitor_.stop();
     wfpLimiter_.cleanup();
 }
@@ -473,18 +534,12 @@ void MainWindow::onDestroy() {
 std::wstring MainWindow::formatBytes(uint64_t bytes) {
     if (bytes < 1024) return std::to_wstring(bytes) + L" B";
     if (bytes < 1024 * 1024) {
-        std::wstringstream ss;
-        ss << std::fixed << std::setprecision(1) << (bytes / 1024.0) << L" KB";
-        return ss.str();
+        std::wstringstream ss; ss << std::fixed << std::setprecision(1) << bytes / 1024.0 << L" KB"; return ss.str();
     }
     if (bytes < 1024ULL * 1024 * 1024) {
-        std::wstringstream ss;
-        ss << std::fixed << std::setprecision(1) << (bytes / 1024.0 / 1024.0) << L" MB";
-        return ss.str();
+        std::wstringstream ss; ss << std::fixed << std::setprecision(1) << bytes / 1024.0 / 1024.0 << L" MB"; return ss.str();
     }
-    std::wstringstream ss;
-    ss << std::fixed << std::setprecision(2) << (bytes / 1024.0 / 1024.0 / 1024.0) << L" GB";
-    return ss.str();
+    std::wstringstream ss; ss << std::fixed << std::setprecision(2) << bytes / 1024.0 / 1024.0 / 1024.0 << L" GB"; return ss.str();
 }
 
 std::wstring MainWindow::formatRate(double bytesPerSec) {
