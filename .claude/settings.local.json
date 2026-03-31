@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake -B build -G \"Visual Studio 17 2022\" -A x64)",
+      "Bash(cmake --build build --config Release)",
+      "Bash(cmake --build build --config Release --target NetMonitor)",
+      "Bash(cmake --build build --config Release --target NetMonitorTests)",
+      "Bash(build/Release/NetMonitorTests.exe)"
+    ]
+  }
+}
