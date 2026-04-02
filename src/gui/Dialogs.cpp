@@ -73,9 +73,9 @@ static HWND makeEdit(HWND parent, const wchar_t* def, int id, int x, int y, int 
                       bool numbersOnly = true) {
     DWORD style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP;
     if (numbersOnly) style |= ES_NUMBER;
-    HWND h = CreateWindowW(L"EDIT", def, style,
+    HWND hwndEdit = CreateWindowW(L"EDIT", def, style,
         x, y, w, h, parent, (HMENU)(INT_PTR)id, GetModuleHandle(nullptr), nullptr);
-    return h;
+    return hwndEdit;
 }
 
 static HWND makeButton(HWND parent, const wchar_t* text, int id,
