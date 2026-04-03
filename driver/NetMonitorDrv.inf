@@ -1,0 +1,37 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=Network
+ClassGuid={4d36e972-e325-11ce-bfc1-08002be10318}
+Provider=%ProviderName%
+DriverVer=04/02/2026,1.0.0.0
+CatalogFile=NetMonitorDrv.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[Manufacturer]
+%ProviderName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%NetMonitorDrv.DeviceDesc%=Install, Root\NetMonitorDrv
+
+[Install]
+CopyFiles=DriverCopyFiles
+
+[Install.Services]
+AddService=NetMonitorDrv,0x00000002,ServiceInstall
+
+[DriverCopyFiles]
+NetMonitorDrv.sys
+
+[ServiceInstall]
+DisplayName=%NetMonitorDrv.ServiceDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\NetMonitorDrv.sys
+
+[Strings]
+ProviderName="NetMonitor"
+NetMonitorDrv.DeviceDesc="NetMonitor WFP Rate Limit Driver"
+NetMonitorDrv.ServiceDesc="NetMonitor WFP Rate Limit Driver"

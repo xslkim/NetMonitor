@@ -174,18 +174,6 @@ void MainWindow::onCreate() {
     // ── ETW monitor ───────────────────────────────────────────────
     etwMonitor_.setCallback([this](uint32_t pid, uint32_t bytes, Direction dir) {
         tracker_.addTraffic(pid, bytes, dir);
-
-        // Check token bucket for rate limiting
-        auto it = limits_.find(pid);
-        if (it == limits_.end()) return;
-        auto& ls = it->second;
-        if (dir == Direction::Upload && ls.sendBucket && ls.sendLimit > 0) {
-            if (!ls.sendBucket->tryConsume(bytes) && !ls.processPath.empty())
-                wfpLimiter_.blockProcess(pid, ls.processPath, Direction::Upload);
-        } else if (dir == Direction::Download && ls.recvBucket && ls.recvLimit > 0) {
-            if (!ls.recvBucket->tryConsume(bytes) && !ls.processPath.empty())
-                wfpLimiter_.blockProcess(pid, ls.processPath, Direction::Download);
-        }
     });
 
     if (!etwMonitor_.start()) {
@@ -194,10 +182,10 @@ void MainWindow::onCreate() {
             L"警告", MB_OK | MB_ICONWARNING);
     }
 
-    // ── WFP ───────────────────────────────────────────────────────
-    if (!wfpLimiter_.init()) {
+    // ── Driver ────────────────────────────────────────────────────
+    if (!driverClient_.init()) {
         MessageBoxW(hwnd_,
-            (L"WFP 初始化失败: " + wfpLimiter_.getLastError()).c_str(),
+            (L"驱动连接失败: " + driverClient_.getLastError()).c_str(),
             L"警告", MB_OK | MB_ICONWARNING);
     }
 
@@ -209,7 +197,6 @@ void MainWindow::onCreate() {
 
     // ── Timers ────────────────────────────────────────────────────
     SetTimer(hwnd_, IDT_REFRESH, 1000, nullptr);
-    SetTimer(hwnd_, IDT_LIMITER, 100,  nullptr);
 }
 
 void MainWindow::applyLimitToProcess(uint32_t pid, Direction dir, uint64_t limitBytesPerSec) {
@@ -218,20 +205,25 @@ void MainWindow::applyLimitToProcess(uint32_t pid, Direction dir, uint64_t limit
         auto [name, path] = resolveProcess(pid);
         ls.processPath = path;
     }
+
+    bool ok = limitBytesPerSec > 0
+        ? driverClient_.setRateLimit(pid, dir, limitBytesPerSec)
+        : driverClient_.removeRateLimit(pid, dir);
+    if (!ok) {
+        MessageBoxW(hwnd_,
+            (L"更新限速失败: " + driverClient_.getLastError()).c_str(),
+            L"错误", MB_OK | MB_ICONERROR);
+        return;
+    }
+
     if (dir == Direction::Download) {
-        ls.recvLimit  = limitBytesPerSec;
-        ls.recvBucket = limitBytesPerSec > 0
-            ? std::make_unique<TokenBucket>(limitBytesPerSec, limitBytesPerSec)
-            : nullptr;
-        if (limitBytesPerSec == 0)
-            wfpLimiter_.unblockProcess(pid, Direction::Download);
+        ls.recvLimit = limitBytesPerSec;
     } else {
-        ls.sendLimit  = limitBytesPerSec;
-        ls.sendBucket = limitBytesPerSec > 0
-            ? std::make_unique<TokenBucket>(limitBytesPerSec, limitBytesPerSec)
-            : nullptr;
-        if (limitBytesPerSec == 0)
-            wfpLimiter_.unblockProcess(pid, Direction::Upload);
+        ls.sendLimit = limitBytesPerSec;
+    }
+
+    if (ls.sendLimit == 0 && ls.recvLimit == 0) {
+        limits_.erase(pid);
     }
 }
 
@@ -244,18 +236,6 @@ void MainWindow::onTimer(UINT_PTR timerId) {
         refreshListView();
         updateStatusBar();
         tracker_.pruneInactive(30);
-    } else if (timerId == IDT_LIMITER) {
-        applyLimits();
-    }
-}
-
-void MainWindow::applyLimits() {
-    for (auto& [pid, ls] : limits_) {
-        if (ls.processPath.empty()) continue;
-        if (ls.recvBucket && ls.recvLimit > 0 && ls.recvBucket->available() > 0)
-            wfpLimiter_.unblockProcess(pid, Direction::Download);
-        if (ls.sendBucket && ls.sendLimit > 0 && ls.sendBucket->available() > 0)
-            wfpLimiter_.unblockProcess(pid, Direction::Upload);
     }
 }
 
@@ -423,8 +403,8 @@ void MainWindow::refreshListView() {
         if (limIt != limits_.end()) {
             info.sendLimit   = limIt->second.sendLimit;
             info.recvLimit   = limIt->second.recvLimit;
-            info.sendBlocked = wfpLimiter_.isBlocked(pid, Direction::Upload);
-            info.recvBlocked = wfpLimiter_.isBlocked(pid, Direction::Download);
+            info.sendBlocked = limIt->second.sendLimit > 0;
+            info.recvBlocked = limIt->second.recvLimit > 0;
         }
         items.push_back(std::move(info));
     }
@@ -464,8 +444,8 @@ void MainWindow::refreshListView() {
         setText(6, info.recvLimit > 0 ? formatRate((double)info.recvLimit) : L"无限制");
         setText(7, info.sendLimit > 0 ? formatRate((double)info.sendLimit) : L"无限制");
         std::wstring st;
-        if (info.recvBlocked) st += L"↓阻断 ";
-        if (info.sendBlocked) st += L"↑阻断 ";
+        if (info.recvBlocked) st += L"↓限速 ";
+        if (info.sendBlocked) st += L"↑限速 ";
         if (st.empty()) st = L"正常";
         setText(8, st);
     }
@@ -503,7 +483,7 @@ void MainWindow::updateStatusBar() {
        << L"   总上行: " << formatRate(ul)
        << L"   报警: " << alertsTriggered << L"/" << alertsTotal << L" 已触发"
        << L"   ETW: " << (etwMonitor_.isRunning() ? L"运行中" : L"未启动")
-       << L"   WFP: " << (wfpLimiter_.isInitialized() ? L"就绪" : L"未初始化");
+       << L"   Driver: " << (driverClient_.isConnected() ? L"已连接" : L"未连接");
     SetWindowTextW(statusBar_, ss.str().c_str());
 }
 
@@ -522,13 +502,16 @@ void MainWindow::updateToolbarState() {
 
 void MainWindow::onDestroy() {
     KillTimer(hwnd_, IDT_REFRESH);
-    KillTimer(hwnd_, IDT_LIMITER);
-    for (auto& [pid, ls] : limits_) {
-        wfpLimiter_.unblockProcess(pid, Direction::Upload);
-        wfpLimiter_.unblockProcess(pid, Direction::Download);
+    for (const auto& [pid, ls] : limits_) {
+        if (ls.sendLimit > 0) {
+            driverClient_.removeRateLimit(pid, Direction::Upload);
+        }
+        if (ls.recvLimit > 0) {
+            driverClient_.removeRateLimit(pid, Direction::Download);
+        }
     }
     etwMonitor_.stop();
-    wfpLimiter_.cleanup();
+    driverClient_.cleanup();
 }
 
 std::wstring MainWindow::formatBytes(uint64_t bytes) {

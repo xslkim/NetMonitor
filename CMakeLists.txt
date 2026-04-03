@@ -27,6 +27,7 @@ add_library(NetMonitorCore STATIC
     src/core/TrafficTracker.cpp
     src/core/AlertManager.cpp
     src/core/EtwMonitor.cpp
+    src/core/DriverClient.cpp
     src/core/WfpLimiter.cpp
 )
 target_include_directories(NetMonitorCore PUBLIC src)

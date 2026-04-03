@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{AA5F7E25-E8B1-4A65-9094-08B1D4426A77}</UniqueIdentifier>
+      <Extensions>c;cc;cpp;cxx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{6DFE3905-FE9A-4301-B372-BD1551757A30}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;hm;inl;inc;xsd</Extensions>
+    </Filter>
+    <Filter Include="Driver Package">
+      <UniqueIdentifier>{6A475E74-5B41-4B26-9CE8-C0A63B0D46B5}</UniqueIdentifier>
+      <Extensions>inf;inx;cat</Extensions>
+    </Filter>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="NetMonitorDrv.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="RateLimitTable.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WfpCallout.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="NetMonitorDrv.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\shared\DriverProtocol.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Inf Include="NetMonitorDrv.inf">
+      <Filter>Driver Package</Filter>
+    </Inf>
+  </ItemGroup>
+</Project>

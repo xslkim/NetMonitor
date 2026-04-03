@@ -8,11 +8,10 @@
 #include <vector>
 
 #include "core/Types.h"
+#include "core/DriverClient.h"
 #include "core/TrafficTracker.h"
 #include "core/AlertManager.h"
 #include "core/EtwMonitor.h"
-#include "core/WfpLimiter.h"
-#include "core/TokenBucket.h"
 #include "resource.h"
 
 class MainWindow {
@@ -38,7 +37,6 @@ private:
     void refreshListView();
     void updateStatusBar();
     void updateToolbarState();
-    void applyLimits();
     void applyLimitToProcess(uint32_t pid, Direction dir, uint64_t limitBytesPerSec);
 
     // Sorting
@@ -70,12 +68,10 @@ private:
     TrafficTracker tracker_;
     AlertManager   alertManager_;
     EtwMonitor     etwMonitor_;
-    WfpLimiter     wfpLimiter_;
+    DriverClient   driverClient_;
 
     // Per-process rate limiting state
     struct LimitState {
-        std::unique_ptr<TokenBucket> sendBucket;
-        std::unique_ptr<TokenBucket> recvBucket;
         uint64_t sendLimit = 0;
         uint64_t recvLimit = 0;
         std::wstring processPath;
