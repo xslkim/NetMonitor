@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "core/Types.h"
-#include "core/DriverClient.h"
+#include "core/DivertLimiter.h"
 #include "core/TrafficTracker.h"
 #include "core/AlertManager.h"
 #include "core/EtwMonitor.h"
@@ -68,7 +68,7 @@ private:
     TrafficTracker tracker_;
     AlertManager   alertManager_;
     EtwMonitor     etwMonitor_;
-    DriverClient   driverClient_;
+    DivertLimiter  divertLimiter_;
 
     // Per-process rate limiting state
     struct LimitState {

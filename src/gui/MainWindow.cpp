@@ -182,10 +182,10 @@ void MainWindow::onCreate() {
             L"警告", MB_OK | MB_ICONWARNING);
     }
 
-    // ── Driver ────────────────────────────────────────────────────
-    if (!driverClient_.init()) {
+    // ── WinDivert limiter ─────────────────────────────────────────
+    if (!divertLimiter_.start()) {
         MessageBoxW(hwnd_,
-            (L"驱动连接失败: " + driverClient_.getLastError()).c_str(),
+            (L"WinDivert 启动失败: " + divertLimiter_.getLastError()).c_str(),
             L"警告", MB_OK | MB_ICONWARNING);
     }
 
@@ -201,19 +201,11 @@ void MainWindow::onCreate() {
 
 void MainWindow::applyLimitToProcess(uint32_t pid, Direction dir, uint64_t limitBytesPerSec) {
     auto& ls = limits_[pid];
-    if (ls.processPath.empty()) {
-        auto [name, path] = resolveProcess(pid);
-        ls.processPath = path;
-    }
 
-    bool ok = limitBytesPerSec > 0
-        ? driverClient_.setRateLimit(pid, dir, limitBytesPerSec)
-        : driverClient_.removeRateLimit(pid, dir);
-    if (!ok) {
-        MessageBoxW(hwnd_,
-            (L"更新限速失败: " + driverClient_.getLastError()).c_str(),
-            L"错误", MB_OK | MB_ICONERROR);
-        return;
+    if (limitBytesPerSec > 0) {
+        divertLimiter_.setLimit(pid, dir, limitBytesPerSec);
+    } else {
+        divertLimiter_.removeLimit(pid, dir);
     }
 
     if (dir == Direction::Download) {
@@ -483,7 +475,7 @@ void MainWindow::updateStatusBar() {
        << L"   总上行: " << formatRate(ul)
        << L"   报警: " << alertsTriggered << L"/" << alertsTotal << L" 已触发"
        << L"   ETW: " << (etwMonitor_.isRunning() ? L"运行中" : L"未启动")
-       << L"   Driver: " << (driverClient_.isConnected() ? L"已连接" : L"未连接");
+       << L"   Divert: " << (divertLimiter_.isRunning() ? L"运行中" : L"未启动");
     SetWindowTextW(statusBar_, ss.str().c_str());
 }
 
@@ -502,16 +494,9 @@ void MainWindow::updateToolbarState() {
 
 void MainWindow::onDestroy() {
     KillTimer(hwnd_, IDT_REFRESH);
-    for (const auto& [pid, ls] : limits_) {
-        if (ls.sendLimit > 0) {
-            driverClient_.removeRateLimit(pid, Direction::Upload);
-        }
-        if (ls.recvLimit > 0) {
-            driverClient_.removeRateLimit(pid, Direction::Download);
-        }
-    }
+    divertLimiter_.clearAllLimits();
+    divertLimiter_.stop();
     etwMonitor_.stop();
-    driverClient_.cleanup();
 }
 
 std::wstring MainWindow::formatBytes(uint64_t bytes) {

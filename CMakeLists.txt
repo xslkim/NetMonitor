@@ -21,18 +21,21 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
+# ── WinDivert ──
+set(WINDIVERT_DIR "${CMAKE_SOURCE_DIR}/third_party/WinDivert")
+
 # ── Core library (shared between app and tests) ──
 add_library(NetMonitorCore STATIC
     src/core/TokenBucket.cpp
     src/core/TrafficTracker.cpp
     src/core/AlertManager.cpp
     src/core/EtwMonitor.cpp
-    src/core/DriverClient.cpp
-    src/core/WfpLimiter.cpp
+    src/core/DivertLimiter.cpp
 )
-target_include_directories(NetMonitorCore PUBLIC src)
+target_include_directories(NetMonitorCore PUBLIC src "${WINDIVERT_DIR}/include")
 target_link_libraries(NetMonitorCore PUBLIC
-    iphlpapi ws2_32 fwpuclnt psapi tdh
+    "${WINDIVERT_DIR}/lib/WinDivert.lib"
+    iphlpapi ws2_32 psapi tdh
 )
 
 # ── Main application ──
@@ -51,6 +54,16 @@ if(MSVC)
     )
 endif()
 
+# Copy WinDivert runtime files next to the executable
+add_custom_command(TARGET NetMonitor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${WINDIVERT_DIR}/bin/WinDivert.dll"
+        "$<TARGET_FILE_DIR:NetMonitor>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${WINDIVERT_DIR}/bin/WinDivert64.sys"
+        "$<TARGET_FILE_DIR:NetMonitor>"
+)
+
 # ── Tests ──
 enable_testing()
 add_executable(NetMonitorTests
@@ -58,6 +71,7 @@ add_executable(NetMonitorTests
     tests/test_token_bucket.cpp
     tests/test_traffic_tracker.cpp
     tests/test_alert_manager.cpp
+    tests/test_divert_limiter.cpp
 )
 target_link_libraries(NetMonitorTests PRIVATE NetMonitorCore GTest::gtest GTest::gtest_main)
 add_test(NAME NetMonitorTests COMMAND NetMonitorTests)
