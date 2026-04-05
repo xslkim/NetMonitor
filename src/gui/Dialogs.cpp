@@ -1,4 +1,6 @@
 #include "gui/Dialogs.h"
+#include "core/TrafficLogger.h"
+#include "resource.h"
 #include <commctrl.h>
 #include <sstream>
 #include <vector>
@@ -6,8 +8,9 @@
 
 #pragma comment(lib, "comctl32.lib")
 
-static const wchar_t* DLG_CLASS = L"NetMonitorModalDlg";
+static const wchar_t* DLG_CLASS  = L"NetMonitorModalDlg";
 static const wchar_t* LIST_CLASS = L"NetMonitorListDlg";
+static const wchar_t* LOG_CLASS  = L"NetMonitorLogDlg";
 
 // ─── Modal window helper ──────────────────────────────────────────────────────
 
@@ -290,6 +293,149 @@ static LRESULT CALLBACK AlertListWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// ─── Log viewer dialog ────────────────────────────────────────────────────────
+
+struct LogViewerData {
+    std::vector<TrafficLogger::SessionEntry> entries;
+};
+
+static std::wstring logFmtBytes(uint64_t b) {
+    wchar_t buf[32];
+    if (b < 1024)
+        swprintf_s(buf, L"%llu B", (unsigned long long)b);
+    else if (b < 1024 * 1024)
+        swprintf_s(buf, L"%.1f KB", b / 1024.0);
+    else if (b < 1024ULL * 1024 * 1024)
+        swprintf_s(buf, L"%.1f MB", b / 1024.0 / 1024.0);
+    else
+        swprintf_s(buf, L"%.2f GB", b / 1024.0 / 1024.0 / 1024.0);
+    return buf;
+}
+
+static void populateLogListView(HWND hList,
+                                const std::vector<TrafficLogger::SessionEntry>& entries) {
+    ListView_DeleteAllItems(hList);
+    for (int r = 0; r < (int)entries.size(); r++) {
+        const auto& e = entries[r];
+
+        LVITEMW item = {};
+        item.mask    = LVIF_TEXT;
+        item.iItem   = r;
+        item.pszText = const_cast<LPWSTR>(e.startTime.c_str());
+        ListView_InsertItem(hList, &item);
+
+        auto setCol = [&](int c, std::wstring t) {
+            ListView_SetItemText(hList, r, c, const_cast<LPWSTR>(t.c_str()));
+        };
+        setCol(1, e.processName);
+        setCol(2, std::to_wstring(e.pid));
+        setCol(3, logFmtBytes(e.totalSent));
+        setCol(4, logFmtBytes(e.totalRecv));
+
+        int64_t d = e.durationSeconds;
+        wchar_t dur[32];
+        swprintf_s(dur, L"%02lld:%02lld:%02lld",
+                   (long long)(d / 3600), (long long)((d % 3600) / 60),
+                   (long long)(d % 60));
+        setCol(5, dur);
+        setCol(6, e.endTime);
+        setCol(7, e.processPath);
+    }
+}
+
+static LRESULT CALLBACK LogViewerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    // Per-window state stored in GWLP_USERDATA
+    LogViewerData* data = reinterpret_cast<LogViewerData*>(
+                              GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    static HWND s_logList = nullptr; // single instance assumption (modal)
+
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCT*>(lp);
+        data = reinterpret_cast<LogViewerData*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        const int BH = 40; // button bar height
+
+        s_logList = CreateWindowExW(0, WC_LISTVIEWW, nullptr,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+            LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            0, 0, rc.right, rc.bottom - BH,
+            hwnd, (HMENU)IDC_LOG_LISTVIEW, GetModuleHandle(nullptr), nullptr);
+        ListView_SetExtendedListViewStyle(s_logList,
+            LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+
+        struct { const wchar_t* name; int w; } cols[] = {
+            {L"开始时间",  150}, {L"进程名",  140}, {L"PID",      60},
+            {L"总上行",    100}, {L"总下行",  100}, {L"会话时长",  85},
+            {L"结束时间",  150}, {L"进程路径", 320},
+        };
+        for (int i = 0; i < 8; i++) {
+            LVCOLUMNW col = {};
+            col.mask     = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+            col.pszText  = const_cast<LPWSTR>(cols[i].name);
+            col.cx       = cols[i].w;
+            col.iSubItem = i;
+            ListView_InsertColumn(s_logList, i, &col);
+        }
+
+        if (data) populateLogListView(s_logList, data->entries);
+
+        // Bottom button bar: [刷新]  [清空日志]  [关闭]
+        int bw = 90, gap = 8;
+        int bx = rc.right - (bw * 3 + gap * 2) - 12;
+        makeButton(hwnd, L"刷新",     IDC_LOG_REFRESH, bx,                rc.bottom - 33, bw, 26);
+        makeButton(hwnd, L"清空日志", IDC_LOG_CLEAR,   bx + bw + gap,     rc.bottom - 33, bw, 26);
+        makeButton(hwnd, L"关闭",     IDOK,            bx + (bw + gap)*2, rc.bottom - 33, bw, 26, true);
+        return 0;
+    }
+    case WM_SIZE: {
+        int w = LOWORD(lp), h = HIWORD(lp);
+        if (s_logList) MoveWindow(s_logList, 0, 0, w, h - 40, TRUE);
+        int bw = 90, gap = 8;
+        int bx = w - (bw * 3 + gap * 2) - 12;
+        auto mv = [&](int id, int x) {
+            HWND h2 = GetDlgItem(hwnd, id);
+            if (h2) MoveWindow(h2, x, h - 33, bw, 26, TRUE);
+        };
+        mv(IDC_LOG_REFRESH, bx);
+        mv(IDC_LOG_CLEAR,   bx + bw + gap);
+        mv(IDOK,            bx + (bw + gap) * 2);
+        return 0;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_LOG_REFRESH:
+            if (data && s_logList) {
+                TrafficLogger logger;
+                data->entries = logger.loadHistory();
+                populateLogListView(s_logList, data->entries);
+            }
+            break;
+        case IDC_LOG_CLEAR:
+            if (MessageBoxW(hwnd,
+                    L"确定要清空所有历史日志吗？此操作不可撤销。",
+                    L"确认清空", MB_YESNO | MB_ICONWARNING) == IDYES) {
+                TrafficLogger logger;
+                logger.clearHistory();
+                if (data) data->entries.clear();
+                if (s_logList) ListView_DeleteAllItems(s_logList);
+            }
+            break;
+        case IDOK:
+            endModal(hwnd, IDOK);
+            break;
+        }
+        return 0;
+    case WM_CLOSE:
+        endModal(hwnd, IDOK);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 namespace Dialogs {
@@ -307,6 +453,7 @@ void registerClasses(HINSTANCE hInstance) {
     };
     reg(DLG_CLASS,  LimitWndProc);
     reg(LIST_CLASS, AlertListWndProc);
+    reg(LOG_CLASS,  LogViewerWndProc);
 
     // AlertWndProc reuses DLG_CLASS but needs its own — register separately
     WNDCLASSEXW wc = {};
@@ -387,6 +534,31 @@ void showAlertListDialog(HWND parent, const std::vector<AlertPolicy>& policies) 
     int w = wr.right - wr.left, h = wr.bottom - wr.top;
     SetWindowPos(hwnd, nullptr,
                  pr.left + (pr.right - pr.left - w) / 2,
+                 pr.top  + (pr.bottom - pr.top  - h) / 2,
+                 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+
+    runModal(hwnd, parent);
+}
+
+void showLogViewerDialog(HWND parent) {
+    LogViewerData data;
+    {
+        TrafficLogger logger;
+        data.entries = logger.loadHistory();
+    }
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME, LOG_CLASS, L"流量历史日志",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+        0, 0, 940, 520, parent, nullptr, GetModuleHandle(nullptr), &data);
+    if (!hwnd) return;
+
+    RECT pr{}, wr{};
+    GetWindowRect(parent, &pr);
+    GetWindowRect(hwnd, &wr);
+    int w = wr.right - wr.left, h = wr.bottom - wr.top;
+    SetWindowPos(hwnd, nullptr,
+                 pr.left + (pr.right  - pr.left - w) / 2,
                  pr.top  + (pr.bottom - pr.top  - h) / 2,
                  0, 0, SWP_NOSIZE | SWP_NOZORDER);
 
