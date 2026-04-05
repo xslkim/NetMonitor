@@ -26,4 +26,7 @@ void showAlertListDialog(HWND parent, const std::vector<AlertPolicy>& policies);
 // Show alert notification (non-blocking via MessageBox on separate thread).
 void showAlertNotification(HWND parent, const AlertPolicy& policy);
 
+// Show traffic history log viewer (modal dialog with ListView).
+void showLogViewerDialog(HWND parent);
+
 } // namespace Dialogs

@@ -127,7 +127,8 @@ void MainWindow::onCreate() {
     btnAddAlert_ = makeBtn(L"+ 添加报警策略", IDM_ADD_ALERT,      x); x += 118;
     btnRmLimit_  = makeBtn(L"× 清除限速",     IDM_REMOVE_LIMITS,  x); x += 118;
     btnRmAlert_  = makeBtn(L"× 清除报警",     IDM_REMOVE_ALERTS,  x); x += 128;
-    btnAlerts_   = makeBtn(L"≡ 报警策略列表", IDM_SHOW_ALERTS,    x);
+    btnAlerts_   = makeBtn(L"≡ 报警策略列表", IDM_SHOW_ALERTS,    x); x += 118;
+    btnShowLog_  = makeBtn(L"📋 查看日志",    IDM_SHOW_LOG,       x);
 
     // Add a hint label after the buttons
     CreateWindowW(L"STATIC",
@@ -197,10 +198,21 @@ void MainWindow::onCreate() {
 
     // ── Timers ────────────────────────────────────────────────────
     SetTimer(hwnd_, IDT_REFRESH, 1000, nullptr);
+
+    // ── Session start & config restore ────────────────────────────
+    sessionStart_ = std::chrono::system_clock::now();
+    restoreConfig();
 }
 
 void MainWindow::applyLimitToProcess(uint32_t pid, Direction dir, uint64_t limitBytesPerSec) {
     auto& ls = limits_[pid];
+
+    // Cache the process path so we can persist limits even after pruning
+    if (ls.processPath.empty()) {
+        auto snap = tracker_.getSnapshot();
+        auto it = snap.find(pid);
+        if (it != snap.end()) ls.processPath = it->second.processPath;
+    }
 
     if (limitBytesPerSec > 0) {
         divertLimiter_.setLimit(pid, dir, limitBytesPerSec);
@@ -215,7 +227,14 @@ void MainWindow::applyLimitToProcess(uint32_t pid, Direction dir, uint64_t limit
     }
 
     if (ls.sendLimit == 0 && ls.recvLimit == 0) {
+        // User explicitly removed all limits — also clear from pending so it
+        // won't be re-applied on the next process launch.
+        if (!ls.processPath.empty())
+            pendingLimitsByPath_.erase(ls.processPath);
         limits_.erase(pid);
+    } else if (!ls.processPath.empty()) {
+        // Keep pending in sync with what's active
+        pendingLimitsByPath_[ls.processPath] = {ls.sendLimit, ls.recvLimit};
     }
 }
 
@@ -313,7 +332,11 @@ void MainWindow::onCommand(int id) {
         Dialogs::showAlertListDialog(hwnd_, alertManager_.getPolicies());
         return;
     }
-    if (selectedPid_ == 0 && id != IDM_SHOW_ALERTS) return;
+    if (id == IDM_SHOW_LOG) {
+        Dialogs::showLogViewerDialog(hwnd_);
+        return;
+    }
+    if (selectedPid_ == 0) return;
 
     auto snapshot = tracker_.getSnapshot();
     auto it = snapshot.find(selectedPid_);
@@ -383,6 +406,40 @@ int MainWindow::compareItems(const ProcessTrafficInfo& a, const ProcessTrafficIn
 
 void MainWindow::refreshListView() {
     auto snapMap = tracker_.getSnapshot();
+
+    // ── Apply pending limits from config restore ──────────────────────────────
+    // For each newly seen process that has a persisted limit, apply it.
+    if (!pendingLimitsByPath_.empty()) {
+        for (const auto& [pid, info] : snapMap) {
+            if (info.processPath.empty()) continue;
+            if (limits_.count(pid)) continue; // already limited this pid
+            auto it = pendingLimitsByPath_.find(info.processPath);
+            if (it == pendingLimitsByPath_.end()) continue;
+            const auto& pl = it->second;
+            if (pl.recvLimit > 0)
+                applyLimitToProcess(pid, Direction::Download, pl.recvLimit);
+            if (pl.sendLimit > 0)
+                applyLimitToProcess(pid, Direction::Upload,   pl.sendLimit);
+        }
+    }
+
+    // ── Auto-reconnect persisted alert policies (pid == 0) ───────────────────
+    {
+        auto policies = alertManager_.getPolicies();
+        for (const auto& p : policies) {
+            if (p.pid != 0) continue;
+            for (const auto& [pid, info] : snapMap) {
+                if (info.processName.empty()) continue;
+                if (info.processName == p.processName) {
+                    AlertPolicy updated = p;
+                    updated.pid = pid;
+                    alertManager_.removePolicy(p.id);
+                    alertManager_.addPolicy(std::move(updated));
+                    break;
+                }
+            }
+        }
+    }
 
     // Build a vector for sorting
     std::vector<ProcessTrafficInfo> items;
@@ -492,11 +549,77 @@ void MainWindow::updateToolbarState() {
     EnableWindow(btnRmAlert_,  hasSel);
 }
 
+void MainWindow::restoreConfig() {
+    ConfigStore::Config cfg;
+    if (!configStore_.load(cfg)) return; // first run or corrupt file — fine
+
+    // Limits: store in pendingLimitsByPath_; applied when process appears
+    for (const auto& le : cfg.limits) {
+        if (le.processPath.empty()) continue;
+        pendingLimitsByPath_[le.processPath] = {le.sendLimit, le.recvLimit};
+    }
+
+    // Alert policies: restored with pid=0; auto-reconnected in refreshListView()
+    for (auto& p : cfg.alertPolicies) {
+        p.pid = 0;
+        alertManager_.addPolicy(std::move(p));
+    }
+}
+
+void MainWindow::saveConfig() {
+    ConfigStore::Config cfg;
+    auto snapshot = tracker_.getSnapshot();
+
+    // Build limit entries (look up processPath from snapshot)
+    for (const auto& [pid, ls] : limits_) {
+        if (ls.sendLimit == 0 && ls.recvLimit == 0) continue;
+        ConfigStore::LimitEntry le;
+        le.sendLimit = ls.sendLimit;
+        le.recvLimit = ls.recvLimit;
+        auto it = snapshot.find(pid);
+        if (it != snapshot.end()) {
+            le.processPath = it->second.processPath;
+            le.processName = it->second.processName;
+        } else if (!ls.processPath.empty()) {
+            le.processPath = ls.processPath;
+        } else {
+            continue; // can't identify process — skip
+        }
+        cfg.limits.push_back(std::move(le));
+    }
+
+    // Also persist any pending limits that were never matched this session
+    for (const auto& [path, pl] : pendingLimitsByPath_) {
+        // Skip if already saved via limits_ above
+        bool alreadySaved = false;
+        for (const auto& le : cfg.limits) {
+            if (le.processPath == path) { alreadySaved = true; break; }
+        }
+        if (!alreadySaved && (pl.sendLimit > 0 || pl.recvLimit > 0)) {
+            ConfigStore::LimitEntry le;
+            le.processPath = path;
+            le.sendLimit   = pl.sendLimit;
+            le.recvLimit   = pl.recvLimit;
+            cfg.limits.push_back(std::move(le));
+        }
+    }
+
+    cfg.alertPolicies = alertManager_.getPolicies();
+    configStore_.save(cfg);
+}
+
 void MainWindow::onDestroy() {
     KillTimer(hwnd_, IDT_REFRESH);
+    etwMonitor_.stop();
+
+    // Flush session log before stopping (tracker data still valid)
+    trafficLogger_.flushSession(tracker_.getSnapshot(), sessionStart_);
+
+    // Persist limits and alert policies
+    saveConfig();
+
     divertLimiter_.clearAllLimits();
     divertLimiter_.stop();
-    etwMonitor_.stop();
 }
 
 std::wstring MainWindow::formatBytes(uint64_t bytes) {

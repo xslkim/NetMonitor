@@ -10,6 +10,12 @@
 #define IDM_REMOVE_LIMITS   2004
 #define IDM_REMOVE_ALERTS   2005
 #define IDM_SHOW_ALERTS     2006
+#define IDM_SHOW_LOG        2007   // 查看流量日志
 
 #define IDT_REFRESH         3001
 #define IDT_LIMITER         3002
+
+// Log viewer dialog controls
+#define IDC_LOG_LISTVIEW    1010
+#define IDC_LOG_REFRESH     1011
+#define IDC_LOG_CLEAR       1012

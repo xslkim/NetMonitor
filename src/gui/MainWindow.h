@@ -12,7 +12,10 @@
 #include "core/TrafficTracker.h"
 #include "core/AlertManager.h"
 #include "core/EtwMonitor.h"
+#include "core/TrafficLogger.h"
+#include "core/ConfigStore.h"
 #include "resource.h"
+#include <chrono>
 
 class MainWindow {
 public:
@@ -33,6 +36,9 @@ private:
     void onCommand(int id);
     void onNotify(NMHDR* nm);
     void onDestroy();
+
+    void restoreConfig();   // Load persisted limits & alert policies on startup
+    void saveConfig();      // Persist limits & alert policies on shutdown
 
     void refreshListView();
     void updateStatusBar();
@@ -61,6 +67,7 @@ private:
     HWND btnRmLimit_  = nullptr;
     HWND btnRmAlert_  = nullptr;
     HWND btnAlerts_   = nullptr;
+    HWND btnShowLog_  = nullptr;
 
     static constexpr int TOOLBAR_H = 38;
 
@@ -69,6 +76,11 @@ private:
     AlertManager   alertManager_;
     EtwMonitor     etwMonitor_;
     DivertLimiter  divertLimiter_;
+    TrafficLogger  trafficLogger_;
+    ConfigStore    configStore_;
+
+    // Session start time (for log flushing on exit)
+    std::chrono::system_clock::time_point sessionStart_;
 
     // Per-process rate limiting state
     struct LimitState {
@@ -77,6 +89,12 @@ private:
         std::wstring processPath;
     };
     std::map<uint32_t, LimitState> limits_;
+
+    // Limits loaded from config, indexed by processPath.
+    // Applied to a PID the first time that process appears in the snapshot.
+    // Kept indefinitely so future instances of the same exe are also limited.
+    struct PendingLimit { uint64_t sendLimit = 0; uint64_t recvLimit = 0; };
+    std::map<std::wstring, PendingLimit> pendingLimitsByPath_;
 
     // Currently selected PID
     uint32_t selectedPid_ = 0;

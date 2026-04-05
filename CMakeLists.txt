@@ -11,8 +11,10 @@ if(MSVC)
     add_compile_options(/utf-8)
 endif()
 
-# ── Google Test via FetchContent ──
+# ── FetchContent ──────────────────────────────────────────────────────────────
 include(FetchContent)
+
+# Google Test
 FetchContent_Declare(
     googletest
     GIT_REPOSITORY https://github.com/google/googletest.git
@@ -20,6 +22,9 @@ FetchContent_Declare(
 )
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
+
+# nlohmann/json (header-only, bundled in third_party/)
+set(NLOHMANN_JSON_DIR "${CMAKE_SOURCE_DIR}/third_party/nlohmann")
 
 # ── WinDivert ──
 set(WINDIVERT_DIR "${CMAKE_SOURCE_DIR}/third_party/WinDivert")
@@ -31,8 +36,10 @@ add_library(NetMonitorCore STATIC
     src/core/AlertManager.cpp
     src/core/EtwMonitor.cpp
     src/core/DivertLimiter.cpp
+    src/core/TrafficLogger.cpp
+    src/core/ConfigStore.cpp
 )
-target_include_directories(NetMonitorCore PUBLIC src "${WINDIVERT_DIR}/include")
+target_include_directories(NetMonitorCore PUBLIC src "${WINDIVERT_DIR}/include" "${NLOHMANN_JSON_DIR}/..")
 target_link_libraries(NetMonitorCore PUBLIC
     "${WINDIVERT_DIR}/lib/WinDivert.lib"
     iphlpapi ws2_32 psapi tdh
