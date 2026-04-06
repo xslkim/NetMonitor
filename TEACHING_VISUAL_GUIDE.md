@@ -41,7 +41,7 @@
 ┌─────────────────────────────┐
 │    令牌桶算法（配额管理）     │  ← 第三步亮起
 ├─────────────────────────────┤
-│  WFP 过滤平台（阻断/放行）   │  ← 第二步亮起
+│  WinDivert 拦截（抓包/放行） │  ← 第二步亮起
 ├─────────────────────────────┤
 │  ETW 事件追踪（流量监控）    │  ← 第一步亮起
 └─────────────────────────────┘
@@ -65,8 +65,8 @@
 **[截图]** 终端运行测试结果，重点展示：
 
 ```
-[==========] Running 29 tests from 3 test suites.
-[  PASSED  ] 29 tests.
+[==========] Running 44 tests from 5 test suites.
+[  PASSED  ] 44 tests.
 ```
 
 绿色 PASSED 文字放大强调。
@@ -77,8 +77,9 @@
 0min ──── 令牌桶（10 测试）✓
          ├── TrafficTracker（9 测试）✓
          ├── AlertManager（10 测试）✓
-         ├── EtwMonitor ✓
-         ├── WfpLimiter ✓
+         ├── PacketScheduler（11 测试）✓
+         ├── FlowTracker（4 测试）✓
+         ├── EtwMonitor + DivertLimiter ✓
          └── Win32 GUI ✓ ──── 120min
 ```
 
@@ -94,16 +95,16 @@
 - 左半屏：错误示意图——`ProcessTrace` 阻塞了主线程，界面卡死（灰色窗口 + 转圈光标）
 - 右半屏：修复后——`ProcessTrace` 在独立线程中运行，主线程正常响应（正常窗口 + 数据刷新）
 
-**坑 2 — WFP 匹配条件：**
-- 左半屏：错误代码片段，用 PID 匹配，标红并打 ×
+**坑 2 — WinDivert 流匹配：**
+- 左半屏：错误方案，直接用 PID 过滤数据包，标红并打 ×
 ```cpp
-// ✗ 错误：传输层无法用 PID 匹配
-condition.fieldKey = FWPM_CONDITION_IP_LOCAL_ADDRESS;
+// ✗ 错误：网络层无法直接获取 PID
+WinDivertOpen("ip and pid == 1234", ...);
 ```
-- 右半屏：正确代码片段，用可执行文件路径匹配，标绿并打 ✓
+- 右半屏：正确方案，FlowTracker 五元组→PID 映射，标绿并打 ✓
 ```cpp
-// ✓ 正确：用应用程序 ID（exe 路径）匹配
-condition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
+// ✓ 正确：用 FlowTracker 将五元组映射到进程 ID
+DWORD pid = flowTracker.lookup(srcAddr, dstAddr, srcPort, dstPort, proto);
 ```
 
 **[文字卡]**
@@ -151,7 +152,7 @@ condition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
 
 **[文字卡]** 黑底白字：
 - 项目名称：**NetMonitor**
-- 技术栈：C++17 / ETW / WFP / Win32 / GoogleTest / CMake
+- 技术栈：C++17 / ETW / WinDivert / Win32 / GoogleTest / CMake
 - 源码链接：（填入实际地址）
 - 「感谢收看」
 
@@ -171,9 +172,9 @@ condition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
 | 6 | 动画 | 三层架构图 | 逐层浮现 |
 | 7 | 动画 | 令牌桶原理图 | 水桶 + 水龙头 + 数据包 |
 | 8 | 录屏 | AI 生成代码过程 | 3-5 倍速 |
-| 9 | 截图 | 29 测试通过 | 终端绿色输出 |
+| 9 | 截图 | 44 测试通过 | 终端绿色输出 |
 | 10 | 动画 | 模块产出时间线 | 0-120min |
-| 11 | 动画 | 踩坑对比（线程 + WFP） | 分屏左错右对 |
+| 11 | 动画 | 踩坑对比（线程 + WinDivert） | 分屏左错右对 |
 | 12 | 文字卡 | 「犯错快改错也快」金句 | 居中大字 |
 | 13 | 录屏 | 完整操作演示 | 实录不加速，约 60 秒 |
 | 14 | 动画 | 时间对比 ×50 | 手工 vs AI |
