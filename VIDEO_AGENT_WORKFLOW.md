@@ -130,7 +130,7 @@ npx create-video@latest . --template blank-ts --no-git
 
 # 安装额外依赖
 npm install shiki gray-matter
-npm install -D @types/node
+npm install -D @types/node ts-node typescript
 ```
 
 ### 0.4.1 配置源仓库路径
@@ -242,11 +242,13 @@ interface ParsedScript {
 
 1. 读取 `src/data/TEACHING_SCRIPT_STORY.md`（Stage 0.4.1 已复制到此路径）
 2. 去掉顶部标题和元信息（第一个 `---` 之前的所有内容）
-3. 以 `---` 分割正文为段落
-4. 对每个段落：去掉空行和 markdown 格式标记，提取纯中文文本
-5. 按上表硬编码段落-素材映射关系（因为映射是固定的）
-6. 写入 `src/data/segments.json`
-7. **额外输出**：为每个段落生成独立的纯文本文件 `src/data/narration_S01.txt` ~ `src/data/narration_S08.txt`，供 Stage 2 TTS 直接读取
+3. 去掉末尾元信息（最后一个 `---` 之后仅含斜体标记 `*...*` 的尾注段落，如 `*全文约 2000 字，录制时长预估 10-12 分钟。*`）
+4. 以 `---` 分割正文为段落
+5. 过滤掉空段落（trim 后为空的段落直接丢弃）
+6. 对每个段落：去掉空行和 markdown 格式标记，提取纯中文文本
+7. 按上表硬编码段落-素材映射关系（因为映射是固定的）
+8. 写入 `src/data/segments.json`
+9. **额外输出**：为每个段落生成独立的纯文本文件 `src/data/narration_S01.txt` ~ `src/data/narration_S08.txt`，供 Stage 2 TTS 直接读取
 
 ### 1.5 验证
 
@@ -332,17 +334,35 @@ ffprobe -v quiet -show_entries format=duration -of csv=p=0 public/audio/S01.mp3
 ffmpeg -f lavfi -i anullsrc=r=44100:cl=mono -t 1.5 -q:a 9 -acodec libmp3lame public/audio/silence.mp3
 ```
 
-最终合并为完整音轨时使用：
+### 2.5.1 VTT 字幕预解析为 JSON
+
+Remotion 的 React 组件无法直接读取文件系统中的 VTT 文件。需要在渲染前将 VTT 解析为 JSON，供组件直接 import：
 
 ```bash
-# 生成 concat 列表
-for seg in S01 S02 S03 S04 S05 S06 S07 S08; do
-  echo "file 'audio/${seg}.mp3'" >> concat.txt
-  echo "file 'audio/silence.mp3'" >> concat.txt
-done
-
-ffmpeg -f concat -safe 0 -i concat.txt -c copy public/audio/full_narration.mp3
+# 在 ~/teaching-video 目录下运行
+node -e "
+const fs = require('fs');
+const segs = ['S01','S02','S03','S04','S05','S06','S07','S08'];
+segs.forEach(seg => {
+  const vtt = fs.readFileSync('public/audio/' + seg + '.vtt', 'utf-8');
+  const cues = [];
+  const blocks = vtt.split(/\n\n+/);
+  for (const block of blocks) {
+    const match = block.match(/(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3})\n([\s\S]+)/);
+    if (match) {
+      const toSec = t => { const p = t.split(':'); return +p[0]*3600 + +p[1]*60 + parseFloat(p[2]); };
+      cues.push({ start: toSec(match[1]), end: toSec(match[2]), text: match[3].trim() });
+    }
+  }
+  fs.writeFileSync('src/data/subtitles_' + seg + '.json', JSON.stringify(cues, null, 2));
+});
+console.log('VTT -> JSON done');
+"
 ```
+
+输出：`src/data/subtitles_S01.json` ~ `src/data/subtitles_S08.json`，格式为 `[{start, end, text}, ...]`。
+
+> **注意**：Stage 2.5 的 silence.mp3 仅用于 Remotion 段落间的黑屏静音，不再需要拼接 `full_narration.mp3`（Remotion 用单段 `<Audio>` 组件加载每段音频，不需要完整音轨）。
 
 ### 2.6 错误处理
 
@@ -488,7 +508,7 @@ const totalAppear = 120; // 第4秒显示总费用
   - 使用 `useCurrentFrame()` 控制显示的字符数
   - `const visibleChars = Math.floor(frame * charsPerFrame)`
   - 每帧显示 2 个字符（约 1 秒显示 60 字）
-- AI 回复内容：「方案分三层：ETW 监控 → 令牌桶配额 → WFP 阻断」
+- AI 回复内容：「方案分三层：ETW 监控 → 令牌桶配额 → WinDivert 拦截」
 - 回复完成后底部浮出一个简化架构图
 
 #### 素材 6 — 三层架构动画（ArchitectureDiagram.tsx）
@@ -552,27 +572,47 @@ const waterLevel = interpolate(
 - 背景是深色代码编辑器风格（VS Code Dark+ 主题）
 - 代码源：从 `src/data/source-samples/TokenBucket.h` 读取（Stage 0.4.1 已复制）
 
-```typescript
-// 从项目读取源代码
+**重要**：`shiki` 的 `getHighlighter()` 是异步的，不能在 Remotion 的同步 React 渲染中直接 `await`。必须在渲染前预生成高亮 HTML：
+
+```bash
+# Stage 3 前置脚本：generate-highlighted-code.ts
+# 在 ~/teaching-video 目录下运行
+npx ts-node -e "
 import { getHighlighter } from 'shiki';
+import * as fs from 'fs';
 
-const highlighter = await getHighlighter({
-  themes: ['dark-plus'],
-  langs: ['cpp'],
-});
+(async () => {
+  const highlighter = await getHighlighter({
+    themes: ['dark-plus'],
+    langs: ['cpp'],
+  });
 
-const html = highlighter.codeToHtml(sourceCode, {
-  lang: 'cpp',
-  theme: 'dark-plus',
-});
+  const sourceCode = fs.readFileSync('src/data/source-samples/TokenBucket.h', 'utf-8');
+  const html = highlighter.codeToHtml(sourceCode, { lang: 'cpp', theme: 'dark-plus' });
+  const lines = sourceCode.split('\n');
+
+  fs.writeFileSync('src/data/highlighted-code.json', JSON.stringify({ html, lines }, null, 2));
+  console.log('Code highlighting done:', lines.length, 'lines');
+})();
+"
 ```
 
-**如果 shiki 在 Remotion 中运行有问题**：降级为手工着色——关键词用蓝色，字符串用橙色，注释用灰色，其余白色。用正则匹配即可。
+输出：`src/data/highlighted-code.json`，包含 `html`（完整高亮 HTML）和 `lines`（逐行源码数组）。
+
+组件中直接 import 使用：
+
+```tsx
+import highlightedCode from '../data/highlighted-code.json';
+// 用 dangerouslySetInnerHTML 渲染预生成的 HTML
+// 用 lines 数组控制逐行显示动画
+```
+
+**降级方案**：如果 shiki 安装或执行有问题，改用手工着色——C++ 关键词用蓝色，字符串用橙色，注释用灰色，其余白色。用正则匹配即可。
 
 #### 素材 9 — 测试结果终端（TestResults.tsx）
 
 **类型**：截图模拟
-**内容**：模拟终端运行 29 个测试全部通过的输出
+**内容**：模拟终端运行 44 个测试全部通过的输出
 **实现要点**：
 - 黑色背景，等宽字体
 - 逐行打字效果显示：
@@ -701,9 +741,40 @@ C++17 / ETW / WinDivert / Win32 / GoogleTest / CMake
 
 ### 3.4 字幕覆盖层（SubtitleOverlay.tsx）
 
-独立组件，读取 VTT 文件，根据当前帧时间显示对应字幕文字。
+独立组件，使用 Stage 2.5.1 预解析的字幕 JSON，根据当前帧时间显示对应字幕文字。
+
+> **注意**：Remotion 的 React 组件运行在 headless Chromium 中，无法直接读取文件系统。因此字幕必须从预解析的 JSON 文件 import，而不是运行时读取 VTT。
 
 ```tsx
+import { useCurrentFrame, useVideoConfig } from 'remotion';
+import { THEME } from '../styles/theme';
+
+// 字幕数据类型（来自 Stage 2.5.1 预解析的 JSON）
+interface SubtitleCue {
+  start: number;  // 秒
+  end: number;    // 秒
+  text: string;
+}
+
+// 每个段落的字幕 JSON 在编排时按段落 ID 动态 import
+// 例如：import cues from '../data/subtitles_S01.json';
+
+const SubtitleOverlay: React.FC<{ cues: SubtitleCue[] }> = ({ cues }) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+  const currentTime = frame / fps;
+
+  const activeCue = cues.find(c => currentTime >= c.start && currentTime <= c.end);
+
+  if (!activeCue) return null;
+
+  return (
+    <div style={subtitleStyle}>
+      {activeCue.text}
+    </div>
+  );
+};
+
 // 字幕样式
 const subtitleStyle: React.CSSProperties = {
   position: 'absolute',
@@ -778,6 +849,21 @@ import { AbsoluteFill, Audio, Sequence, staticFile, interpolate, useCurrentFrame
 import segments from './data/segments.json';
 import audioManifest from './data/audio-manifest.json';
 
+// 预解析的字幕 JSON（Stage 2.5.1 生成）
+import subtitlesS01 from './data/subtitles_S01.json';
+import subtitlesS02 from './data/subtitles_S02.json';
+import subtitlesS03 from './data/subtitles_S03.json';
+import subtitlesS04 from './data/subtitles_S04.json';
+import subtitlesS05 from './data/subtitles_S05.json';
+import subtitlesS06 from './data/subtitles_S06.json';
+import subtitlesS07 from './data/subtitles_S07.json';
+import subtitlesS08 from './data/subtitles_S08.json';
+
+const subtitleMap: Record<string, any[]> = {
+  S01: subtitlesS01, S02: subtitlesS02, S03: subtitlesS03, S04: subtitlesS04,
+  S05: subtitlesS05, S06: subtitlesS06, S07: subtitlesS07, S08: subtitlesS08,
+};
+
 export const MainVideo: React.FC = () => {
   const frame = useCurrentFrame();
   const fps = 30;
@@ -815,8 +901,8 @@ export const MainVideo: React.FC = () => {
             {/* 视觉素材层 —— 根据 segment.assets 决定显示哪些组件 */}
             <SegmentVisuals segment={segment} durationInFrames={durationInFrames} />
 
-            {/* 字幕覆盖层 */}
-            <SubtitleOverlay vttFile={audioSeg.subtitleFile} />
+            {/* 字幕覆盖层（使用预解析的 JSON，不是 VTT 文件） */}
+            <SubtitleOverlay cues={subtitleMap[audioSeg.id] ?? []} />
           </Sequence>
         );
 
@@ -833,6 +919,52 @@ export const MainVideo: React.FC = () => {
 ```typescript
 // src/timing.ts
 // 每个段落内有多个素材，需要将段落总时长分配给各个素材
+
+import { BillingMock } from './components/BillingMock';
+import { TaskManagerMock } from './components/TaskManagerMock';
+import { PricingComparison } from './components/PricingComparison';
+import { TextCard } from './components/TextCard';
+import { ChatSimulation } from './components/ChatSimulation';
+import { ArchitectureDiagram } from './components/ArchitectureDiagram';
+import { TokenBucketAnimation } from './components/TokenBucketAnimation';
+import { CodeGeneration } from './components/CodeGeneration';
+import { TestResults } from './components/TestResults';
+import { ModuleTimeline } from './components/ModuleTimeline';
+import { BugComparison } from './components/BugComparison';
+import { NetMonitorDemo } from './components/NetMonitorDemo';
+import { TimeComparison } from './components/TimeComparison';
+import { AIInternAnalogy } from './components/AIInternAnalogy';
+
+// assetId → React 组件映射表
+const ASSET_COMPONENT_MAP: Record<number, React.FC<{ durationInFrames: number }>> = {
+  1: BillingMock,
+  2: TaskManagerMock,
+  3: PricingComparison,
+  4: TextCard,           // 「花钱买黑盒」金句
+  5: ChatSimulation,
+  6: ArchitectureDiagram,
+  7: TokenBucketAnimation,
+  8: CodeGeneration,
+  9: TestResults,
+  10: ModuleTimeline,
+  11: BugComparison,
+  12: TextCard,          // 「犯错快改错也快」金句
+  13: NetMonitorDemo,
+  14: TimeComparison,
+  15: AIInternAnalogy,
+  16: TextCard,          // 结尾金句
+  17: TextCard,          // 片尾信息
+};
+
+function getComponentName(asset: { id: number }): string {
+  const comp = ASSET_COMPONENT_MAP[asset.id];
+  return comp?.name ?? 'TextCard';
+}
+
+// 根据 assetId 返回对应的 React 组件
+export function getAssetComponent(id: number): React.FC<{ durationInFrames: number }> {
+  return ASSET_COMPONENT_MAP[id] ?? TextCard;
+}
 
 interface AssetTiming {
   assetId: number;
@@ -884,16 +1016,23 @@ function computeAssetTimings(segment: Segment, totalFrames: number): AssetTiming
 // src/components/SegmentVisuals.tsx
 // 根据 segment 的 assets 列表，用 <Sequence> 按计算好的时序渲染各素材组件
 
+import { AbsoluteFill, Sequence } from 'remotion';
+import { computeAssetTimings } from '../timing';
+import { getAssetComponent } from '../timing';
+
 const SegmentVisuals: React.FC<{ segment: Segment; durationInFrames: number }> = ({ segment, durationInFrames }) => {
   const timings = computeAssetTimings(segment, durationInFrames);
 
   return (
     <AbsoluteFill>
-      {timings.map((t) => (
-        <Sequence from={t.startFrame} durationInFrames={t.durationFrames} key={t.assetId}>
-          <AssetComponent id={t.assetId} durationInFrames={t.durationFrames} />
-        </Sequence>
-      ))}
+      {timings.map((t) => {
+        const Component = getAssetComponent(t.assetId);
+        return (
+          <Sequence from={t.startFrame} durationInFrames={t.durationFrames} key={t.assetId}>
+            <Component durationInFrames={t.durationFrames} />
+          </Sequence>
+        );
+      })}
     </AbsoluteFill>
   );
 };
@@ -976,8 +1115,15 @@ npx remotion render MainVideo \
 如果完整渲染失败（OOM 或超时），改用分段策略：
 
 ```bash
-# 计算总帧数
-TOTAL=$(node -e "console.log(Math.ceil(require('./src/data/audio-manifest.json').totalDurationSeconds * 30))")
+# 计算总帧数（必须与 Root.tsx 的 totalDuration 一致：音频 + 段落间隔 + intro/outro）
+TOTAL=$(node -e "
+  const m = require('./src/data/audio-manifest.json');
+  const fps = 30;
+  const audioFrames = Math.ceil(m.totalDurationSeconds * fps);
+  const gapFrames = (m.segments.length - 1) * Math.round(1.5 * fps);
+  const introOutro = 2 * fps + 2 * fps;
+  console.log(audioFrames + gapFrames + introOutro);
+")
 
 # 每段 3000 帧（约 100 秒）
 CHUNK=3000
@@ -1106,7 +1252,9 @@ done
   │       │   └── DivertLimiter.h
   │       ├── segments.json              # Stage 1 输出
   │       ├── narration_S01.txt ~ S08.txt # Stage 1 输出（供 TTS 读取）
-  │       └── audio-manifest.json        # Stage 2 输出
+  │       ├── audio-manifest.json        # Stage 2 输出
+  │       ├── subtitles_S01.json ~ S08.json # Stage 2.5.1 VTT 预解析
+  │       └── highlighted-code.json      # Stage 3 前置 shiki 预生成
   ├── public/
   │   └── audio/
   │       ├── S01.mp3 ~ S08.mp3          # Stage 2 输出
@@ -1132,7 +1280,7 @@ sudo apt update && sudo apt install -y curl wget git build-essential ffmpeg chro
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt install -y nodejs
 python3 -m venv ~/video-agent-venv && source ~/video-agent-venv/bin/activate && pip install edge-tts
 npx create-video@latest ~/teaching-video --template blank-ts --no-git
-cd ~/teaching-video && npm install shiki gray-matter
+cd ~/teaching-video && npm install shiki gray-matter && npm install -D ts-node typescript @types/node
 # 复制源仓库文件到 Remotion 项目（见 Stage 0.4.1）
 export NETMONITOR_REPO_DIR="/path/to/NetMonitor"  # Agent 根据实际路径填写
 mkdir -p src/data/source-samples
@@ -1154,6 +1302,12 @@ for seg in S01 S02 S03 S04 S05 S06 S07 S08; do
     --write-media "public/audio/${seg}.mp3" --write-subtitles "public/audio/${seg}.vtt"
 done
 # 生成 audio-manifest.json（用 ffprobe 获取每段时长）
+# VTT 字幕预解析为 JSON（见 Stage 2.5.1）
+node -e "..." # 将 VTT 转为 subtitles_S01.json ~ S08.json
+
+# ===== STAGE 3 前置 =====
+# 预生成代码高亮 JSON（shiki 是 async，不能在 Remotion 组件里直接调用）
+npx ts-node -e "..." # 生成 src/data/highlighted-code.json
 
 # ===== STAGE 3 =====
 # 创建所有组件文件（Agent 需编写每个 .tsx 文件）
